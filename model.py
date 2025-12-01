@@ -6,6 +6,7 @@ import math
 from transformers import GPT2LMHeadModel
 import tiktoken
 import time
+import sys
 
 @dataclass
 class GPTConfig:
@@ -22,6 +23,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embed, 3 * config.n_embed)
         #output projection
         self.c_proj = nn.Linear(config.n_embed, config.n_embed)
+        self.c_proj.NANOGPT_SCALE_INIT = 1.0
         
         self.n_head = config.n_head
         self.n_embed = config.n_embed
@@ -47,7 +49,8 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embed, 4 * config.n_embed)
         self.c_proj = nn.Linear(4 * config.n_embed, config.n_embed)
-    
+        self.c_proj.NANOGPT_SCALE_INIT = 1.0
+
     def forward(self, x):
         x = self.c_fc(x)
         x = nn.functional.gelu(x)
@@ -82,8 +85,24 @@ class GPT(nn.Module):
             "ln_f": nn.LayerNorm(config.n_embed),
         })
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
-    
-    def forward(self, idx):
+        self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weights)
+
+
+    def _init_weights(self, module):
+        std = 0.02
+        if isinstance(module, nn.Linear):
+            if hasattr(module, "NANOGPT_SCALE_INIT"):
+                std = 1/math.sqrt(2*self.config.n_layer)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+
+
+    def forward(self, idx, targets=None):
         B, T = idx.size()
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
         pos_embd = self.transformer.wpe(pos)
@@ -93,7 +112,11 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        
+        return logits, loss
     
     @classmethod
     def from_pretrained(cls, model_type):
@@ -136,29 +159,78 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
 
-num_samples = 5
-max_seq_len = 50
+class DataLoader:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+        with open("test_set.txt", "r") as f:
+            text = f.read()
+        tokens = tokenizer.encode(text) # (n_tokens,)
+        self.tokens = torch.tensor(tokens)
+        self.current_idx = 0
+        print(f"Loaded {len(self.tokens)} tokens")
+        print(f"Number of batches per epoch: {len(self.tokens) // (B * T)}")
 
-model = GPT.from_pretrained("gpt2")
-model.eval()
-model.to("cuda")
+    def get_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_idx:self.current_idx+B*T+1] # (B*T+1,)
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+        self.current_idx += B*T
+        if self.current_idx > len(self.tokens) - B*T - 1:
+            self.current_idx = 0
+        return x, y
 
-tokenizer = tiktoken.get_encoding("gpt2")
-tokens = tokenizer.encode("Hello, I'm a language model")
-x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).repeat(num_samples, 1)
-x = x.to("cuda")
+device ="cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif torch.backends.mps.is_available():
+    device = "mps"
+print(f"Using device: {device}")
 
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+if device == "cuda":
+    torch.cuda.manual_seed(42)
+elif device == "mps":
+    torch.mps.manual_seed(42)
 
-while x.size(1) < max_seq_len:
-    logits = model(x)
-    logits = logits[:, -1, :] 
-    probs = F.softmax(logits, dim=-1)
-    topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-    x_i = torch.multinomial(topk_probs, num_samples=1) # (B, 1)
-    x_next = torch.gather(topk_indices, dim=-1, index=x_i) # (B, 1)
-    x = torch.cat((x, x_next), dim=1)
 
+tokenizer = tiktoken.get_encoding("gpt2")
+
+train_loader = DataLoader(B=8, T=1024)
+#model = GPT.from_pretrained("gpt2")k
+model = GPT(GPTConfig())
+model.to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+for iter in range(50):
+    time_start = time.time()
+    x, y = train_loader.get_batch()
+    x = x.to(device)
+    y = y.to(device)
+    logits, loss = model(x, y)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    torch.cuda.synchronize()
+    time_elapsed = time.time()-time_start
+    print(f"Step {iter}, Loss: {loss.item()}, Time: {time_elapsed*1000:.2f}ms")
+
+
+model.eval()
+test_text = "Hello, how are you?"
+test_tokens = tokenizer.encode(test_text)
+num_samples = 4
+test_tokens = torch.tensor(test_tokens, dtype=torch.long, device=device).unsqueeze(0)
+test_tokens = test_tokens.repeat(num_samples, 1)
+print(test_tokens.shape)
+with torch.no_grad():
+    
+    while test_tokens.size(1) < 100:
+        logits, _ = model(test_tokens)
+        next_token_logits = logits[:, -1, :]
+        probs = F.softmax(next_token_logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        test_tokens = torch.cat((test_tokens, next_token), dim=1)
 for i in range(num_samples):
-    print(tokenizer.decode(x[i].tolist()))
+    print(tokenizer.decode(test_tokens[i].tolist()))
+    print("-"*100)
